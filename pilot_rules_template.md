@@ -19,7 +19,7 @@ This document answers:
 pilot_group: Pinckney Teachers and support staff
 pilot_size: 20
 start_date: 4/13/2026
-send_days: Monday, Thursday 
+send_days: Monday, Wednesday
 send_time: 2:25 PM
 timezone: America/Chicago
 lessons_per_week: 2

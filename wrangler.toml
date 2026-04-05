@@ -12,3 +12,11 @@ database_id = "3817d1f0-7999-4cec-8a83-c78a5ff4b40f"
 
 [vars]
 APP_NAME = "micro-pd-pilot"
+SCHEDULER_TIMEZONE = "America/Chicago"
+SCHEDULER_SEND_DAYS = "Monday,Wednesday"
+SCHEDULER_SEND_HOUR = "14"
+SCHEDULER_SEND_MINUTE = "25"
+DEFAULT_PILOT_GROUP = "cohort_1"
+
+[triggers]
+crons = ["*/5 * * * *"]

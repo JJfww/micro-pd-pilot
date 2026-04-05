@@ -4,6 +4,11 @@ export interface Env {
   TWILIO_ACCOUNT_SID: string;
   TWILIO_AUTH_TOKEN: string;
   TWILIO_PHONE_NUMBER: string;
+  SCHEDULER_TIMEZONE: string;
+  SCHEDULER_SEND_DAYS: string;
+  SCHEDULER_SEND_HOUR: string;
+  SCHEDULER_SEND_MINUTE: string;
+  DEFAULT_PILOT_GROUP: string;
 }
 
 type CountRow = {
@@ -98,6 +103,81 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+function normalizeRole(role: string | null): string {
+  return (role ?? "").trim().toLowerCase();
+}
+
+function parseCsvList(value: string): string[] {
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function getLocalTimeParts(date: Date, timezone: string): Record<string, string> {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    weekday: "long",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+
+  const parts = formatter.formatToParts(date);
+  const entries = parts
+    .filter((part) => part.type !== "literal")
+    .map((part) => [part.type, part.value] as const);
+
+  return Object.fromEntries(entries);
+}
+
+function isScheduledSendTime(env: Env, date: Date): boolean {
+  const timezone = env.SCHEDULER_TIMEZONE || "America/Chicago";
+  const sendDays = parseCsvList(env.SCHEDULER_SEND_DAYS || "Monday,Wednesday");
+  const sendHour = Number.parseInt(env.SCHEDULER_SEND_HOUR || "14", 10);
+  const sendMinute = Number.parseInt(env.SCHEDULER_SEND_MINUTE || "25", 10);
+  const local = getLocalTimeParts(date, timezone);
+  const hour = Number.parseInt(local.hour ?? "-1", 10);
+  const minute = Number.parseInt(local.minute ?? "-1", 10);
+
+  return sendDays.includes(local.weekday ?? "") && hour === sendHour && minute === sendMinute;
+}
+
+function mapRoleToTargets(role: string | null): Set<string> {
+  const normalizedRole = normalizeRole(role);
+  const targets = new Set<string>();
+
+  if (
+    normalizedRole.includes("teacher") ||
+    normalizedRole === "transition_specialist" ||
+    normalizedRole === "social_worker"
+  ) {
+    targets.add("Teacher");
+    targets.add("Teacher/Para");
+  }
+
+  if (normalizedRole.includes("para")) {
+    targets.add("Teacher/Para");
+  }
+
+  return targets;
+}
+
+function staffMatchesLessonTarget(staff: StaffRow, lesson: LessonRow): boolean {
+  if ((staff.pilot_group ?? "").trim().toLowerCase() === "test") {
+    return true;
+  }
+
+  if (!lesson.staff_target) {
+    return true;
+  }
+
+  return mapRoleToTargets(staff.role).has(lesson.staff_target);
+}
+
 function normalizeMcResponse(input: string): string | null {
   const trimmed = input.trim().toUpperCase();
   const match = trimmed.match(/\b([ABC])\b/);
@@ -113,23 +193,27 @@ async function listLessons(db: D1Database): Promise<LessonRow[]> {
     .prepare(
       `SELECT lesson_slug, lesson_title, staff_target, indicator13_component, instructional_focus, status
        FROM lessons
-       ORDER BY lesson_title`
+       ORDER BY rowid`
     )
     .all<LessonRow>();
 
   return result.results;
 }
 
-async function listActiveStaff(db: D1Database): Promise<StaffRow[]> {
-  const result = await db
-    .prepare(
-      `SELECT staff_id, first_name, last_name, mobile_phone, role, school, active, pilot_group, opted_out
-       FROM staff
-       WHERE active = 1 AND opted_out = 0
-       ORDER BY last_name, first_name`
-    )
-    .all<StaffRow>();
+async function listActiveStaff(db: D1Database, pilotGroup?: string | null): Promise<StaffRow[]> {
+  const baseQuery = `SELECT staff_id, first_name, last_name, mobile_phone, role, school, active, pilot_group, opted_out
+     FROM staff
+     WHERE active = 1 AND opted_out = 0`;
 
+  if (pilotGroup) {
+    const result = await db
+      .prepare(`${baseQuery} AND pilot_group = ?1 ORDER BY last_name, first_name`)
+      .bind(pilotGroup)
+      .all<StaffRow>();
+    return result.results;
+  }
+
+  const result = await db.prepare(`${baseQuery} ORDER BY last_name, first_name`).all<StaffRow>();
   return result.results;
 }
 
@@ -313,6 +397,56 @@ async function getActiveAssignmentForPhone(
   );
 }
 
+async function getOpenAssignmentForStaff(
+  db: D1Database,
+  staffId: string
+): Promise<AssignmentRow | null> {
+  return (
+    (await db
+      .prepare(
+        `SELECT
+           la.assignment_id,
+           la.lesson_slug,
+           l.lesson_title,
+           la.staff_id,
+           s.first_name || ' ' || s.last_name AS staff_name,
+           s.mobile_phone AS staff_phone,
+           la.status,
+           la.scheduled_at,
+           la.started_at,
+           la.completed_mc_at,
+           la.completed_full_at,
+           la.last_step_sent,
+           la.last_message_at,
+           la.reminder_sent_at,
+           la.created_at,
+           la.updated_at
+         FROM lesson_assignments la
+         INNER JOIN lessons l ON l.lesson_slug = la.lesson_slug
+         INNER JOIN staff s ON s.staff_id = la.staff_id
+         WHERE la.staff_id = ?1
+           AND la.status IN ('scheduled', 'waiting_for_mc', 'waiting_for_reflection')
+         ORDER BY la.created_at DESC
+         LIMIT 1`
+      )
+      .bind(staffId)
+      .first<AssignmentRow>()) ?? null
+  );
+}
+
+async function listAssignedLessonSlugsForStaff(db: D1Database, staffId: string): Promise<Set<string>> {
+  const result = await db
+    .prepare(
+      `SELECT DISTINCT lesson_slug
+       FROM lesson_assignments
+       WHERE staff_id = ?1`
+    )
+    .bind(staffId)
+    .all<{ lesson_slug: string }>();
+
+  return new Set(result.results.map((row) => row.lesson_slug));
+}
+
 async function updateAssignmentAfterStart(
   db: D1Database,
   assignmentId: string,
@@ -478,14 +612,16 @@ async function sendSms(
   env: Env,
   to: string,
   body: string,
-  statusCallbackUrl: string
+  statusCallbackUrl?: string
 ): Promise<MessageSendResult> {
   const credentials = btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`);
   const form = new URLSearchParams();
   form.set("To", to);
   form.set("From", env.TWILIO_PHONE_NUMBER);
   form.set("Body", body);
-  form.set("StatusCallback", statusCallbackUrl);
+  if (statusCallbackUrl) {
+    form.set("StatusCallback", statusCallbackUrl);
+  }
 
   const response = await fetch(
     `https://api.twilio.com/2010-04-01/Accounts/${env.TWILIO_ACCOUNT_SID}/Messages.json`,
@@ -514,12 +650,14 @@ async function sendSms(
 async function sendStepMessage(
   db: D1Database,
   env: Env,
-  requestUrl: string,
+  requestUrl: string | null,
   assignment: AssignmentRow,
   stepOrder: number,
   messageBody: string
 ): Promise<void> {
-  const statusCallbackUrl = `${new URL(requestUrl).origin}/webhooks/twilio/status`;
+  const statusCallbackUrl = requestUrl
+    ? `${new URL(requestUrl).origin}/webhooks/twilio/status`
+    : undefined;
   const result = await sendSms(env, assignment.staff_phone!, messageBody, statusCallbackUrl);
   const timestamp = nowIso();
 
@@ -539,7 +677,7 @@ async function sendStepMessage(
 async function startAssignment(
   db: D1Database,
   env: Env,
-  requestUrl: string,
+  requestUrl: string | null,
   assignmentId: string
 ): Promise<{ assignment: AssignmentRow; sentSteps: number[] }> {
   const assignment = await getAssignment(db, assignmentId);
@@ -742,6 +880,50 @@ async function processInboundReply(
   return jsonResponse({ ok: true, status: "ignored_unhandled_assignment_state" });
 }
 
+async function runScheduledLessonDispatch(env: Env, requestUrl: string | null): Promise<{
+  ok: true;
+  dispatched_at: string;
+  pilot_group: string;
+  started_assignment_ids: string[];
+  skipped_staff: Array<{ staff_id: string; reason: string }>;
+}> {
+  const pilotGroup = env.DEFAULT_PILOT_GROUP || "cohort_1";
+  const staffMembers = await listActiveStaff(env.DB, pilotGroup);
+  const lessons = await listLessons(env.DB);
+  const startedAssignmentIds: string[] = [];
+  const skippedStaff: Array<{ staff_id: string; reason: string }> = [];
+
+  for (const staff of staffMembers) {
+    const openAssignment = await getOpenAssignmentForStaff(env.DB, staff.staff_id);
+    if (openAssignment) {
+      skippedStaff.push({ staff_id: staff.staff_id, reason: "open_assignment_exists" });
+      continue;
+    }
+
+    const assignedLessonSlugs = await listAssignedLessonSlugsForStaff(env.DB, staff.staff_id);
+    const nextLesson = lessons.find(
+      (lesson) => !assignedLessonSlugs.has(lesson.lesson_slug) && staffMatchesLessonTarget(staff, lesson)
+    );
+
+    if (!nextLesson) {
+      skippedStaff.push({ staff_id: staff.staff_id, reason: "no_matching_unassigned_lesson" });
+      continue;
+    }
+
+    const assignmentId = await createAssignment(env.DB, staff.staff_id, nextLesson.lesson_slug, nowIso());
+    await startAssignment(env.DB, env, requestUrl, assignmentId);
+    startedAssignmentIds.push(assignmentId);
+  }
+
+  return {
+    ok: true,
+    dispatched_at: nowIso(),
+    pilot_group: pilotGroup,
+    started_assignment_ids: startedAssignmentIds,
+    skipped_staff: skippedStaff,
+  };
+}
+
 export default {
   async fetch(request, env): Promise<Response> {
     const url = new URL(request.url);
@@ -779,12 +961,62 @@ export default {
     }
 
     if (url.pathname === "/admin/staff" && request.method === "GET") {
-      return jsonResponse({ ok: true, staff: await listActiveStaff(env.DB) });
+      const pilotGroup = url.searchParams.get("pilot_group");
+      return jsonResponse({ ok: true, staff: await listActiveStaff(env.DB, pilotGroup) });
     }
 
     if (url.pathname === "/admin/assignments" && request.method === "GET") {
       const staffId = url.searchParams.get("staff_id");
       return jsonResponse({ ok: true, assignments: await listAssignments(env.DB, staffId) });
+    }
+
+    if (url.pathname === "/admin/scheduler/preview" && request.method === "GET") {
+      const pilotGroup = url.searchParams.get("pilot_group") ?? env.DEFAULT_PILOT_GROUP ?? "cohort_1";
+      const staffMembers = await listActiveStaff(env.DB, pilotGroup);
+      const lessons = await listLessons(env.DB);
+      const preview = [];
+
+      for (const staff of staffMembers) {
+        const openAssignment = await getOpenAssignmentForStaff(env.DB, staff.staff_id);
+        const assignedLessonSlugs = await listAssignedLessonSlugsForStaff(env.DB, staff.staff_id);
+        const nextLesson = lessons.find(
+          (lesson) =>
+            !assignedLessonSlugs.has(lesson.lesson_slug) && staffMatchesLessonTarget(staff, lesson)
+        );
+
+        preview.push({
+          staff_id: staff.staff_id,
+          staff_name: `${staff.first_name} ${staff.last_name}`,
+          role: staff.role,
+          pilot_group: staff.pilot_group,
+          open_assignment: openAssignment
+            ? {
+                assignment_id: openAssignment.assignment_id,
+                lesson_slug: openAssignment.lesson_slug,
+                status: openAssignment.status,
+              }
+            : null,
+          next_lesson: nextLesson
+            ? {
+                lesson_slug: nextLesson.lesson_slug,
+                lesson_title: nextLesson.lesson_title,
+                staff_target: nextLesson.staff_target,
+              }
+            : null,
+        });
+      }
+
+      return jsonResponse({
+        ok: true,
+        scheduler: {
+          timezone: env.SCHEDULER_TIMEZONE,
+          send_days: env.SCHEDULER_SEND_DAYS,
+          send_hour: env.SCHEDULER_SEND_HOUR,
+          send_minute: env.SCHEDULER_SEND_MINUTE,
+          pilot_group: pilotGroup,
+        },
+        preview,
+      });
     }
 
     if (url.pathname === "/admin/assignments" && request.method === "POST") {
@@ -882,5 +1114,12 @@ export default {
       },
       200
     );
+  },
+  async scheduled(controller, env, ctx): Promise<void> {
+    if (!isScheduledSendTime(env, new Date(controller.scheduledTime))) {
+      return;
+    }
+
+    ctx.waitUntil(runScheduledLessonDispatch(env, null));
   },
 } satisfies ExportedHandler<Env>;
