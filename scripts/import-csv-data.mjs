@@ -145,7 +145,7 @@ async function importRoster(remote) {
   const rows = parseCsv(content);
 
   const validRows = rows.filter((row) => row.staff_id && row.mobile_phone);
-  const statements = ["DELETE FROM staff;"];
+  const statements = [];
 
   for (const row of validRows) {
     statements.push(`
@@ -161,7 +161,16 @@ async function importRoster(remote) {
         ${normalizeBoolean(row.active)},
         ${sqlValue(row.pilot_group || null)},
         0
-      );
+      )
+      ON CONFLICT(staff_id) DO UPDATE SET
+        first_name = excluded.first_name,
+        last_name = excluded.last_name,
+        mobile_phone = excluded.mobile_phone,
+        role = excluded.role,
+        school = excluded.school,
+        active = excluded.active,
+        pilot_group = excluded.pilot_group,
+        updated_at = CURRENT_TIMESTAMP;
     `.trim());
   }
 
