@@ -1,0 +1,8 @@
+node_modules/
+.wrangler/
+.env
+.env.*
+roster.csv
+MicroPD_Pilot.csv
+.DS_Store
+npm-debug.log*

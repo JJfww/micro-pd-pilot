@@ -1,0 +1,14 @@
+name = "micro-pd-pilot"
+main = "src/index.ts"
+compatibility_date = "2026-04-01"
+
+[observability]
+enabled = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "micro-pd-pilot"
+database_id = "3817d1f0-7999-4cec-8a83-c78a5ff4b40f"
+
+[vars]
+APP_NAME = "micro-pd-pilot"

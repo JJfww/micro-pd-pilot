@@ -1,0 +1,23 @@
+{
+  "name": "micro-pd",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "cf-typegen": "wrangler types",
+    "db:migrate:local": "wrangler d1 execute micro-pd-pilot --local --file=./migrations/0001_initial.sql",
+    "db:migrate:remote": "wrangler d1 execute micro-pd-pilot --remote --file=./migrations/0001_initial.sql",
+    "import:local": "node scripts/import-csv-data.mjs --local",
+    "import:remote": "node scripts/import-csv-data.mjs --remote",
+    "import:roster:remote": "node scripts/import-csv-data.mjs --remote --roster-only",
+    "import:lessons:remote": "node scripts/import-csv-data.mjs --remote --lessons-only"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260401.0",
+    "csv-parse": "^5.5.6",
+    "typescript": "^5.8.3",
+    "wrangler": "^4.54.0"
+  }
+}
